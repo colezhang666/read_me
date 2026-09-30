@@ -41,3 +41,7 @@ dotnet run --project tests/PocketReader.Tests.csproj -c Release
 可选：命令末尾追加 `-- "原小说TXT路径"`，会额外验证本次提供小说的1070章、前言及原文件副本。
 
 Git已有迁移前基线和后续功能改动记录。历史版本文件仍在原工作目录作为迁移备份，后续不在那里改代码。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
