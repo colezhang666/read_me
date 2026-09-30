@@ -1,0 +1,5 @@
+**/bin/
+**/obj/
+app/
+backups/
+*.zip
