@@ -51,6 +51,13 @@ internal static class Program
                 try { TxtImporter.Import(gap, scratch, token: cancel.Token); throw new Exception("取消未生效"); }
                 catch (OperationCanceledException) { Check(Directory.GetDirectories(scratch).Length == before, "导入取消清理临时书籍"); }
             }
+            string customPath = Path.Combine(scratch, "english.txt");
+            File.WriteAllText(customPath, "Chapter 1 One\nText A\nChapter 2 Two\nText B\n");
+            var customBook = TxtImporter.Import(customPath, scratch, options: new ImportOptions("utf-8", "自定义正则", @"^Chapter\s+\d+.*$"));
+            Check(customBook.Chapters.Count == 2, "自定义章节规则识别英文标题");
+            Check(TxtImporter.Import(customPath, scratch, options: new ImportOptions("utf-8", "不分章")).Chapters.Count == 1, "不分章选项保留完整正文");
+            try { _ = new ImportOptions("自动", "自定义正则", "["); throw new Exception("应拒绝无效正则"); } catch (ArgumentException) { Console.WriteLine("PASS 无效导入规则拒绝执行"); }
+            Check(ReadingTools.ChapterNumber("第八章 测试") == 8 && ReadingTools.ChapterNumber("第一千零七十章 结束") == 1070, "中文章号转换");
             string store = Path.Combine(scratch, "store");
             LibraryStore.Save(new ReaderSettings { FontSize = 18 }, store);
             LibraryStore.Save(new ReaderSettings { FontSize = 23 }, store);
@@ -142,11 +149,82 @@ internal static class Program
                 foreach (var item in live.Books.ToArray()) Call(form, "RemoveBook", item);
                 Check(live.Books.Count == 0 && reader.TextLength == 0 && chapters.Items.Count == 0, "移除最后一本书清空正文和目录");
                 Call(form, "RestoreBook", activeBook);
+                Call(form, "OpenChapter", 0, 3500);
+                var filter = Field<TextBox>(form, "chapterFilter");
+                filter.Text = "缺章";
+                Check(chapters.Items.Count == 1 && Field<int>(form, "currentChapter") == 0, "目录筛选不改变阅读位置");
+                chapters.SelectedIndex = 0;
+                Check(Field<int>(form, "currentChapter") == 1, "筛选后的目录映射原始章节");
+                var numberBox = Field<TextBox>(form, "chapterNumber"); numberBox.Text = "8"; Call(form, "GoChapterNumber");
+                Check(Field<int>(form, "currentChapter") == 2, "输入章号跳转中文标题");
+                numberBox.Text = "999"; Call(form, "GoChapterNumber"); Check(Field<int>(form, "currentChapter") == 2, "无效章号不改变阅读位置");
+                Call(form, "OpenChapter", 0, 3500);
+                int origin = (int)Call(form, "GetVisibleOffset")!;
+                results.Items.Clear(); results.Items.Add(new SearchHit { BookId = activeBook.Id, Chapter = 1, Offset = 0 }); results.Items.Add(new SearchHit { BookId = activeBook.Id, Chapter = 2, Offset = 0 });
+                results.SelectedIndex = -1; Call(form, "MoveSearchResult", 1);
+                Check(Field<int>(form, "currentChapter") == 1, "下一个搜索结果跳转");
+                Call(form, "MoveSearchResult", 1); Check(Field<int>(form, "currentChapter") == 2, "继续跳转下一个结果");
+                Call(form, "MoveSearchResult", -1); Check(Field<int>(form, "currentChapter") == 1, "上一个搜索结果跳转");
+                Call(form, "ReturnFromSearch"); Check(Field<int>(form, "currentChapter") == 0 && (int)Call(form, "GetVisibleOffset")! == origin, "返回搜索前的章节和精确位置");
+                live.NavigationHotkeys["NextChapter"] = (int)(Keys.Control | Keys.N);
+                reader.Focus(); Call(form, "HandleShortcut", form, new KeyEventArgs(Keys.Control | Keys.N)); Check(Field<int>(form, "currentChapter") == 1, "自定义切章快捷键执行");
+                filter.Focus(); filter.Text = ""; Call(form, "HandleShortcut", form, new KeyEventArgs(Keys.Right)); Check(Field<int>(form, "currentChapter") == 1, "文本输入框方向键不触发翻页");
+                var strip = Field<ToolStrip>(form, "toolbar");
+                int bookmarkCount = activeBook.Bookmarks.Count;
+                strip.Items.OfType<ToolStripButton>().Single(b => b.Text == "加书签").PerformClick();
+                Check(activeBook.Bookmarks.Count == bookmarkCount + 1, "工具栏折叠菜单按钮可执行操作");
+                Call(form, "OpenChapter", 0, 0);
+                live.Mode = "翻页"; Call(form, "Reflow", (int?)0);
+                var pages = Field<List<int>>(form, "pageStarts");
+                string content = Field<string>(form, "chapterContent");
+                Check(pages.Count > 1 && pages[0] == 0 && pages.Zip(pages.Skip(1)).All(p => p.First < p.Second), "真正分页生成连续有序的页面边界");
+                var reconstructed = new StringBuilder();
+                for (int p = 0; p < pages.Count; p++) { Call(form, "ShowPage", p); reconstructed.Append(reader.Text); }
+                Check(reconstructed.ToString() == content, "逐页拼接与整章完全一致，没有丢字和重复");
+                Call(form, "ShowPage", 0); Call(form, "TurnPage", 1);
+                Check(Field<int>(form, "pageIndex") == 1 && (int)Call(form, "GetVisibleOffset")! == pages[1], "下一页切换固定页面并保存全章偏移");
+                int pageOffset = pages[1];
+                Call(form, "AddBookmark", form, EventArgs.Empty); Check(activeBook.Bookmarks.Last().Offset == pageOffset, "分页书签记录全章位置");
+                Call(form, "ShowPage", 0); Field<ListBox>(form, "bookmarks").SelectedIndex = Field<ListBox>(form, "bookmarks").Items.Count - 1; Call(form, "JumpBookmark");
+                Check(Field<int>(form, "pageIndex") == 1, "分页书签跳回对应页面");
+                Call(form, "Reflow", (int?)pageOffset); Check(Field<List<int>>(form, "pageStarts")[Field<int>(form, "pageIndex")] <= pageOffset, "重新分页保留原位置所在页");
+                // The visible page must fit, rather than relying on a hidden scrollbar.
+                Call(form, "ShowPage", 1);
+                int bottomY = reader.GetPositionFromCharIndex(Math.Max(0, reader.TextLength - 1)).Y;
+                Check(bottomY + reader.Font.Height <= reader.ClientSize.Height, "分页内容在视口内完整显示");
+                Call(form, "ShowPage", pages.Count - 1); Call(form, "TurnPage", 1);
+                Check(Field<int>(form, "currentChapter") == 1, "末页翻到下一章");
+                Call(form, "TurnPage", -1); Check(Field<int>(form, "currentChapter") == 0 && Field<int>(form, "pageIndex") == Field<List<int>>(form, "pageStarts").Count - 1, "章首页回到上一章末页");
+                var oldBounds = form.Bounds; Call(form, "ToggleFocusMode");
+                Check((int)Call(form, "ResizeHit", form.PointToScreen(new Point(1,1)))! == 13, "专注窗口左上角支持原生缩放命中");
+                form.Size = new Size(520, 400); Application.DoEvents();
+                Check(form.Size == new Size(520,400), "专注模式可调整窗口尺寸");
+                Call(form, "ToggleFocusMode"); Check(form.Size == new Size(520,400), "退出专注保留调整后的窗口尺寸"); form.Bounds = oldBounds; Application.DoEvents();
+                live.Mode = "滚动"; Call(form, "Reflow", (int?)saved.Books[0].LastOffset);
+                Call(form, "SaveState");
+                using (var previewDialog = (Form)Activator.CreateInstance(typeof(ReaderForm).Assembly.GetType("PocketReader.ImportPreviewDialog")!, customPath)!)
+                {
+                    previewDialog.Show();
+                    var wait = System.Diagnostics.Stopwatch.StartNew();
+                    var acceptButton = Field<Button>(previewDialog, "accept");
+                    while (!acceptButton.Enabled && wait.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(1); }
+                    Check(acceptButton.Enabled && Field<ListBox>(previewDialog, "chapterList").Items.Count > 0, "导入预览在后台完成并展示目录");
+                    Field<ComboBox>(previewDialog, "rule").SelectedItem = "自定义正则";
+                    Field<TextBox>(previewDialog, "pattern").Text = @"^Chapter\s+\d+.*$";
+                    Check(!acceptButton.Enabled, "调整导入规则后必须重新预览");
+                    var task = (Task)Call(previewDialog, "RefreshPreview")!;
+                    wait.Restart(); while (!task.IsCompleted && wait.ElapsedMilliseconds < 10000) { Application.DoEvents(); Thread.Sleep(1); }
+                    Check(task.IsCompletedSuccessfully && acceptButton.Enabled && Field<ListBox>(previewDialog, "chapterList").Items.Count == 2, "调整规则后的预览与最终导入一致");
+                    previewDialog.Close();
+                }
                 form.Close();
                 using var reopened = new ReaderForm();
                 reopened.Show(); Application.DoEvents();
                 var reopenedReader = Field<RichTextBox>(reopened, "reader"); Check(reopenedReader.GetLineFromCharIndex((int)Call(reopened, "GetVisibleOffset")!) == reopenedReader.GetLineFromCharIndex(saved.Books[0].LastOffset), "退出再打开精确恢复所在行");
-                var reopenedLive = Field<ReaderSettings>(reopened, "settings"); Check(reopenedLive.LineSpacing == 1.8m && reopenedReader.GetPositionFromCharIndex(reopenedReader.GetFirstCharIndexFromLine(1)).Y - reopenedReader.GetPositionFromCharIndex(0).Y > normalGap, "重开自动应用保存的排版设置"); reopened.Close();
+                var reopenedLive = Field<ReaderSettings>(reopened, "settings"); Check(reopenedLive.LineSpacing == 1.8m && reopenedReader.GetPositionFromCharIndex(reopenedReader.GetFirstCharIndexFromLine(1)).Y - reopenedReader.GetPositionFromCharIndex(0).Y > normalGap, "重开自动应用保存的排版设置"); reopenedLive.Mode = "翻页"; Call(reopened, "Reflow", (int?)3500); Call(reopened, "SaveState"); int pageSaved = (int)Call(reopened, "GetVisibleOffset")!; reopened.Close();
+                using var pagedReopened = new ReaderForm(); pagedReopened.Show(); Application.DoEvents();
+                Check(Field<ReaderSettings>(pagedReopened, "settings").Mode == "翻页" && (int)Call(pagedReopened, "GetVisibleOffset")! == pageSaved, "退出重开保留分页模式与页面进度");
+                pagedReopened.Close();
             }
             finally { if (Directory.Exists(testRoot)) Directory.Delete(testRoot, true); }
         }

@@ -8,7 +8,7 @@ public sealed class ReaderForm : Form
     private readonly ReaderSettings settings;
     private readonly TabControl sidebarTabs = new() { Dock = DockStyle.Fill, Width = 285 };
     private readonly SplitContainer mainSplit = new() { Dock = DockStyle.Fill, SplitterDistance = 285, FixedPanel = FixedPanel.Panel1 };
-    private FlowLayoutPanel? toolbar;
+    private ToolStrip? toolbar;
     private bool focusMode;
     private bool sidebarWasCollapsed;
     private Rectangle previousBounds;
@@ -19,7 +19,7 @@ public sealed class ReaderForm : Form
     private readonly ListBox books = new() { Dock = DockStyle.Fill };
     private readonly ListBox removedBooks = new() { Dock = DockStyle.Fill };
     private readonly ListBox chapters = new() { Dock = DockStyle.Fill };
-    private readonly RichTextBox reader = new() { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, DetectUrls = false, ReadOnly = true, HideSelection = false };
+    private readonly ReadingBox reader = new() { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, DetectUrls = false, ReadOnly = true, HideSelection = false };
     private readonly ComboBox mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
     private readonly ComboBox theme = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
     private readonly NumericUpDown fontSize = new() { Minimum = 1, Maximum = 32, Value = 17, Width = 65 };
@@ -38,6 +38,14 @@ public sealed class ReaderForm : Form
     private bool saveFailed;
     private bool importing;
     private bool closing;
+    private readonly TextBox chapterFilter = new() { Width = 160, PlaceholderText = "筛选章节名称" };
+    private readonly TextBox chapterNumber = new() { Width = 65, PlaceholderText = "章号" };
+    private readonly Button goChapterButton = new() { Text = "跳转", AutoSize = true };
+    private (string BookId, int Chapter, int Offset)? searchOrigin;
+    private string chapterContent = "";
+    private List<int> pageStarts = [0];
+    private int pageIndex;
+    private bool reflowPending;
 
     public ReaderForm()
     {
@@ -47,14 +55,7 @@ public sealed class ReaderForm : Form
         settings = LibraryStore.Load();
         if (string.IsNullOrWhiteSpace(settings.Theme)) settings.Theme = "浅色";
         KeyPreview = true;
-        KeyDown += (_, e) =>
-        {
-            Keys pressed = e.KeyCode | e.Modifiers;
-            if (pressed == (Keys)settings.HideWindowHotkey) { HideToTray(); e.SuppressKeyPress = true; }
-            else if (pressed == (Keys)settings.FocusModeHotkey) { ToggleFocusMode(); e.SuppressKeyPress = true; }
-            else if (pressed == (Keys)settings.DirectoryHotkey) { ToggleDirectoryDrawer(); e.SuppressKeyPress = true; }
-            else if (focusMode && e.KeyCode == Keys.Escape) { ToggleFocusMode(); e.SuppressKeyPress = true; }
-        };
+        KeyDown += HandleShortcut;
         trayIcon.Icon = SystemIcons.Application;
         trayIcon.Text = "Read_me";
         trayIcon.Visible = true;
@@ -69,7 +70,7 @@ public sealed class ReaderForm : Form
         Shown += (_, _) =>
         {
             ApplyParagraphLayout();
-            RestoreReadingPosition();
+            RestoreReadingPosition(); Reflow();
             if (LibraryStore.RecoveryNotice != null) MessageBox.Show(this, LibraryStore.RecoveryNotice, "存档恢复");
         };
         FormClosing += (_, e) =>
@@ -88,7 +89,7 @@ public sealed class ReaderForm : Form
 
     private void BuildUi()
     {
-        toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8), WrapContents = true };
+        toolbar = new ToolStrip { Dock = DockStyle.Top, GripStyle = ToolStripGripStyle.Hidden, CanOverflow = true, AutoSize = false, Height = 32 };
         var import = new Button { Text = "导入 TXT", AutoSize = true };
         import.Click += ImportClick;
         var addBookmark = new Button { Text = "加书签", AutoSize = true };
@@ -110,17 +111,23 @@ public sealed class ReaderForm : Form
             settings.FontFamilyName = dialog.Font.Name;
             settings.FontSize = Math.Clamp(dialog.Font.Size, 1, 32);
             fontSize.Value = (decimal)settings.FontSize;
-            ApplyFont(); ScrollToOffset(offset); SaveState();
+            ApplyFont(); Reflow(offset); SaveState();
         };
         mode.Items.AddRange(["滚动", "翻页"]); mode.SelectedItem = settings.Mode;
-        mode.SelectedIndexChanged += (_, _) => { settings.Mode = mode.Text; ApplyMode(); SaveState(); };
+        mode.SelectedIndexChanged += (_, _) => { int offset = reader.Paged ? pageStarts[pageIndex] : GetVisibleOffset(); settings.Mode = mode.Text; Reflow(offset); SaveState(); };
         theme.Items.AddRange(["浅色", "夜间"]); theme.SelectedItem = settings.Theme;
         theme.SelectedIndexChanged += (_, _) => { settings.Theme = theme.Text; ApplyTheme(); SaveState(); };
         fontSize.Value = (decimal)Math.Clamp(settings.FontSize, 1, 32);
-        fontSize.ValueChanged += (_, _) => { int offset = GetVisibleOffset(); settings.FontSize = (float)fontSize.Value; ApplyFont(); ScrollToOffset(offset); SaveState(); };
+        fontSize.ValueChanged += (_, _) => { int offset = GetVisibleOffset(); settings.FontSize = (float)fontSize.Value; ApplyFont(); Reflow(offset); SaveState(); };
         searchBox.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) StartSearch(); };
-        var search = new Button { Text = "搜索", AutoSize = true }; search.Click += (_, _) => StartSearch();
-        toolbar.Controls.AddRange([import, addBookmark, removeBookmark, directoryButton, focusButton, settingsButton, hideButton, fontButton, new Label { Text = "模式", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, mode, new Label { Text = "主题", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, theme, new Label { Text = "字号", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, fontSize, searchBox, search]);
+        var search = new Button { Text = "搜索", AutoSize = true }; search.Click += (_, _) => { OpenSearch(); if (searchBox.Text.Trim().Length > 0) StartSearch(); };
+        Control[] toolbarControls = [import, addBookmark, removeBookmark, directoryButton, focusButton, settingsButton, hideButton, fontButton, new Label { Text = "模式", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, mode, new Label { Text = "主题", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, theme, new Label { Text = "字号", AutoSize = true, Padding = new Padding(12, 7, 0, 0) }, fontSize, search];
+        foreach (var control in toolbarControls)
+        {
+            if (control is Button button) { var item = new ToolStripButton(button.Text); item.Click += (_, _) => button.PerformClick(); button.TextChanged += (_, _) => item.Text = button.Text; button.EnabledChanged += (_, _) => item.Enabled = button.Enabled; toolbar.Items.Add(item); }
+            else if (control is Label label) toolbar.Items.Add(new ToolStripLabel(label.Text));
+            else toolbar.Items.Add(new ToolStripControlHost(control) { AutoSize = false, Size = new Size(control.Width, 25) });
+        }
         Controls.Add(toolbar);
 
         var left = sidebarTabs;
@@ -133,8 +140,19 @@ public sealed class ReaderForm : Form
         });
         books.ContextMenuStrip = bookMenu;
         books.MouseDown += (_, e) => { if (e.Button == MouseButtons.Right) { int index = books.IndexFromPoint(e.Location); if (index >= 0) books.SelectedIndex = index; } };
-        var chapterTab = new TabPage("目录"); chapterTab.Controls.Add(chapters); chapters.SelectedIndexChanged += (_, _) => SelectChapter(); left.TabPages.Add(chapterTab);
-        var searchTab = new TabPage("搜索结果"); searchTab.Controls.Add(results); results.DoubleClick += (_, _) => JumpSearch(); left.TabPages.Add(searchTab);
+        var chapterTab = new TabPage("目录"); chapterTab.Controls.Add(chapters);
+        var directoryControls = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
+        directoryControls.Controls.AddRange([chapterFilter, chapterNumber, goChapterButton]);
+        chapterTab.Controls.Add(directoryControls);
+        chapterFilter.TextChanged += (_, _) => RefreshChapters();
+        goChapterButton.Click += (_, _) => GoChapterNumber();
+        chapterNumber.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { GoChapterNumber(); e.SuppressKeyPress = true; } }; chapters.SelectedIndexChanged += (_, _) => SelectChapter(); left.TabPages.Add(chapterTab);
+        var searchTab = new TabPage("搜索结果"); searchTab.Controls.Add(results);
+        var searchControls = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
+        searchControls.Controls.Add(searchBox);
+        var runSearch = new Button { Text = "搜索", AutoSize = true }; runSearch.Click += (_, _) => StartSearch(); searchControls.Controls.Add(runSearch);
+        foreach (var item in new[] { ("上一个", -1), ("下一个", 1), ("返回阅读", 0) }) { var button = new Button { Text = item.Item1, AutoSize = true }; button.Click += (_, _) => { if (item.Item2 == 0) ReturnFromSearch(); else MoveSearchResult(item.Item2); }; searchControls.Controls.Add(button); }
+        searchTab.Controls.Add(searchControls); results.DoubleClick += (_, _) => JumpSearch(); left.TabPages.Add(searchTab);
         var bookmarkTab = new TabPage("书签"); bookmarkTab.Controls.Add(bookmarks); bookmarks.DoubleClick += (_, _) => JumpBookmark(); left.TabPages.Add(bookmarkTab);
         var trashTab = new TabPage("回收站"); trashTab.Controls.Add(removedBooks); left.TabPages.Add(trashTab);
         var trashMenu = new ContextMenuStrip();
@@ -149,10 +167,15 @@ public sealed class ReaderForm : Form
         readerPanel.Padding = new Padding(Math.Clamp(settings.TextMargin, 0, 100));
         readerPanel.Controls.Add(reader);
         split.Panel2.Controls.Add(readerPanel); split.Panel2.Controls.Add(readerTitle);
-        reader.KeyDown += ReaderKeyDown; reader.MouseUp += (_, _) => SavePosition(); reader.VScroll += (_, _) => SavePosition();
+        reader.MouseUp += (_, _) => SavePosition(); reader.VScroll += (_, _) => SavePosition();
         reader.MouseDown += (_, e) => { if (settings.Mode == "翻页" && e.Button == MouseButtons.Left) PageClick(e.X); };
         Controls.Add(split);
         ApplyTheme(); ApplyFont();
+        reader.TurnPage = TurnPage; reader.DragWindow = _ => BeginWindowAction(2);
+        reader.EdgeHit = ResizeHit; reader.ResizeWindow = BeginWindowAction;
+        reader.SizeChanged += (_, _) => { if (!loading && currentBook != null) ScheduleReflow(); };
+        readerPanel.MouseDown += (_, e) => { if (focusMode && e.Button == MouseButtons.Left) { int hit = ResizeHit(readerPanel.PointToScreen(e.Location)); if (hit != 0) BeginWindowAction(hit); } };
+        readerPanel.MouseMove += (_, e) => { int hit = focusMode ? ResizeHit(readerPanel.PointToScreen(e.Location)) : 0; readerPanel.Cursor = hit is 10 or 11 ? Cursors.SizeWE : hit is 12 or 15 ? Cursors.SizeNS : hit is 13 or 17 ? Cursors.SizeNWSE : hit is 14 or 16 ? Cursors.SizeNESW : Cursors.Default; };
     }
 
     private void LoadBooks()
@@ -173,14 +196,15 @@ public sealed class ReaderForm : Form
         if (books.SelectedItem is not BookRecord book) return;
         SavePosition();
         searchCancellation?.Cancel();
+        searchOrigin = null;
         results.Items.Clear();
         currentBook = book; settings.CurrentBookId = book.Id;
         currentChapter = -1;
         loading = true;
-        chapters.Items.Clear(); chapters.Items.AddRange(book.Chapters.ToArray());
+        chapterFilter.Clear(); RefreshChapters();
         bookmarks.Items.Clear(); bookmarks.Items.AddRange(book.Bookmarks.ToArray());
         int index = Math.Clamp(book.LastChapter, 0, Math.Max(0, book.Chapters.Count - 1));
-        if (book.Chapters.Count > 0) chapters.SelectedIndex = index;
+        if (book.Chapters.Count > 0) chapters.SelectedItem = book.Chapters[index];
         loading = false;
         if (book.Chapters.Count > 0) OpenChapter(index, book.LastOffset);
     }
@@ -188,7 +212,7 @@ public sealed class ReaderForm : Form
     private void SelectChapter()
     {
         if (loading || currentBook == null || chapters.SelectedIndex < 0) return;
-        OpenChapter(chapters.SelectedIndex, 0);
+        OpenChapter(currentBook.Chapters.IndexOf((ChapterRecord)chapters.SelectedItem!), 0);
     }
 
     private void OpenChapter(int index, int offset)
@@ -199,11 +223,11 @@ public sealed class ReaderForm : Form
         {
             string content = LibraryStore.ReadChapter(currentBook, index);
             currentChapter = index; currentBook.LastChapter = index;
-            reader.Text = content;
+            reader.Text = content; chapterContent = reader.Text; pageStarts = [0]; pageIndex = 0;
             ApplyParagraphLayout();
             ScrollToOffset(offset);
-            currentBook.LastOffset = Math.Clamp(offset, 0, reader.TextLength);
-            chapters.SelectedIndex = index;
+            currentBook.LastOffset = Math.Clamp(offset, 0, chapterContent.Length);
+            chapters.SelectedItem = currentBook.Chapters[index];
             if (readerTitle != null) readerTitle.Text = $"{currentBook.Title}  ·  {currentBook.Chapters[index].Title}  ({index + 1}/{currentBook.Chapters.Count})";
             ApplyMode();
             loading = false;
@@ -217,13 +241,15 @@ public sealed class ReaderForm : Form
         if (importing) return;
         using var dialog = new OpenFileDialog { Filter = "TXT 文件|*.txt|所有文件|*.*", Title = "选择小说 TXT" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        using var preview = new ImportPreviewDialog(dialog.FileName);
+        if (preview.ShowDialog(this) != DialogResult.OK) return;
         try
         {
             importing = true;
             if (sender is Button button) button.Enabled = false;
             Cursor = Cursors.WaitCursor;
             var progress = new Progress<string>(text => { if (!closing) Text = "Read_me · " + text; });
-            var book = await Task.Run(() => TxtImporter.Import(dialog.FileName, LibraryStore.Root, progress));
+            var book = await Task.Run(() => TxtImporter.Import(dialog.FileName, LibraryStore.Root, progress, options: preview.Options));
             var duplicate = settings.Books.Concat(settings.RemovedBooks).FirstOrDefault(x => x.Fingerprint == book.Fingerprint);
             if (duplicate != null)
             {
@@ -268,8 +294,10 @@ public sealed class ReaderForm : Form
     {
         if (results.SelectedItem is SearchHit hit && hit.BookId == currentBook?.Id)
         {
+            if (searchOrigin == null) searchOrigin = (currentBook!.Id, currentChapter, GetVisibleOffset());
             OpenChapter(hit.Chapter, hit.Offset);
-            reader.Select(Math.Clamp(hit.Offset, 0, reader.TextLength), Math.Min(searchBox.Text.Trim().Length, Math.Max(0, reader.TextLength - hit.Offset)));
+            int localOffset = hit.Offset - (settings.Mode == "翻页" ? pageStarts[pageIndex] : 0);
+            reader.Select(Math.Clamp(localOffset, 0, reader.TextLength), Math.Min(searchBox.Text.Trim().Length, Math.Max(0, reader.TextLength - localOffset)));
             reader.ScrollToCaret();
         }
     }
@@ -284,6 +312,7 @@ public sealed class ReaderForm : Form
 
     private void ScrollToOffset(int offset)
     {
+        if (reader.Paged) offset -= pageStarts[pageIndex];
         reader.Select(Math.Clamp(offset, 0, reader.TextLength), 0);
         reader.ScrollToCaret();
         if (reader.IsHandleCreated)
@@ -308,7 +337,7 @@ public sealed class ReaderForm : Form
     private void AddBookmark(object? sender, EventArgs e)
     {
         if (currentBook == null || currentChapter < 0) return;
-        int offset = reader.SelectionLength > 0 ? reader.SelectionStart : GetVisibleOffset(); var bookmark = new BookmarkRecord { Chapter = currentChapter, Offset = offset, Label = $"{currentBook.Chapters[currentChapter].Title} · 位置 {offset}" };
+        int offset = reader.SelectionLength > 0 ? reader.SelectionStart + (settings.Mode == "翻页" ? pageStarts[pageIndex] : 0) : GetVisibleOffset(); var bookmark = new BookmarkRecord { Chapter = currentChapter, Offset = offset, Label = $"{currentBook.Chapters[currentChapter].Title} · 位置 {offset}" };
         currentBook.Bookmarks.Add(bookmark); bookmarks.Items.Add(bookmark); SaveState();
     }
     private void RemoveBookmark(object? sender, EventArgs e) { if (bookmarks.SelectedItem is BookmarkRecord item && currentBook != null) { currentBook.Bookmarks.Remove(item); bookmarks.Items.Remove(item); SaveState(); } }
@@ -354,10 +383,11 @@ public sealed class ReaderForm : Form
         }
         else
         {
+            Rectangle focusBounds = Bounds;
             focusMode = false;
             WindowState = FormWindowState.Normal;
             FormBorderStyle = previousBorderStyle;
-            Bounds = previousBounds;
+            Bounds = previousWindowState == FormWindowState.Normal ? focusBounds : previousBounds;
             toolbar.Visible = true;
             readerTitle.Visible = true;
             mainSplit.Panel1Collapsed = sidebarWasCollapsed;
@@ -375,27 +405,16 @@ public sealed class ReaderForm : Form
             settings.FocusModeHotkey = (int)dialog.FocusModeKey;
             settings.HideWindowHotkey = (int)dialog.HideWindowKey;
             settings.DirectoryHotkey = (int)dialog.DirectoryKey;
+            settings.NavigationHotkeys = dialog.NavigationHotkeys;
             int offset = GetVisibleOffset();
             settings.TextMargin = dialog.TextMargin;
             settings.LineSpacing = dialog.LineSpacing;
             settings.ParagraphSpacing = dialog.ParagraphSpacing;
             readerPanel.Padding = new Padding(settings.TextMargin);
             ApplyParagraphLayout();
-            ScrollToOffset(offset);
+            Reflow(offset);
             SaveState();
         }
-    }
-
-    private void ReaderKeyDown(object? sender, KeyEventArgs e)
-    {
-        if (e.Control && e.KeyCode == Keys.Right) { NextChapter(); e.SuppressKeyPress = true; return; }
-        if (e.Control && e.KeyCode == Keys.Left) { PreviousChapter(); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode == Keys.Up) { ScrollLines(-3); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode == Keys.Down) { ScrollLines(3); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode is Keys.Left or Keys.PageUp) { ScrollLines(-VisibleLineCount()); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode is Keys.Right or Keys.PageDown) { ScrollLines(VisibleLineCount()); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode == Keys.Home) { reader.Select(0, 0); reader.ScrollToCaret(); SavePosition(); e.SuppressKeyPress = true; return; }
-        if (e.KeyCode == Keys.End) { reader.Select(reader.TextLength, 0); reader.ScrollToCaret(); SavePosition(); e.SuppressKeyPress = true; }
     }
 
     private int VisibleLineCount()
@@ -419,6 +438,7 @@ public sealed class ReaderForm : Form
     private void ScrollLines(int count)
     {
         if (count == 0 || currentBook == null || currentChapter < 0) return;
+        if (settings.Mode == "翻页") { TurnPage(Math.Sign(count)); return; }
         int first = FirstVisibleLine();
         int visible = VisibleLineCount();
         int lines = DisplayLineCount();
@@ -437,7 +457,7 @@ public sealed class ReaderForm : Form
         SavePosition();
     }
 
-    private void PageClick(int x) => ScrollLines(x < reader.ClientSize.Width / 2 ? -VisibleLineCount() : VisibleLineCount());
+    private void PageClick(int x) => TurnPage(x < reader.ClientSize.Width / 2 ? -1 : 1);
 
     [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
@@ -446,6 +466,7 @@ public sealed class ReaderForm : Form
     private void PreviousChapter() { if (currentBook != null && currentChapter > 0) OpenChapter(currentChapter - 1, 0); }
     private int GetVisibleOffset()
     {
+        if (settings.Mode == "翻页") return pageStarts[Math.Clamp(pageIndex, 0, pageStarts.Count - 1)];
         if (reader.TextLength == 0 || !reader.IsHandleCreated) return reader.SelectionStart;
         return Math.Clamp(reader.GetCharIndexFromPosition(new Point(2, 2)), 0, reader.TextLength);
     }
@@ -469,7 +490,7 @@ public sealed class ReaderForm : Form
             currentBook.LastChapter = currentChapter;
             currentBook.LastOffset = GetVisibleOffset();
         }
-        Rectangle bounds = focusMode ? previousBounds : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        Rectangle bounds = focusMode && previousWindowState != FormWindowState.Normal ? previousBounds : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         settings.WindowX = bounds.X; settings.WindowY = bounds.Y;
         settings.WindowWidth = bounds.Width; settings.WindowHeight = bounds.Height;
         settings.WindowMaximized = (focusMode ? previousWindowState : WindowState) == FormWindowState.Maximized;
@@ -538,6 +559,7 @@ public sealed class ReaderForm : Form
         searchCancellation?.Cancel();
         loading = true;
         currentBook = null; currentChapter = -1;
+        chapterContent = ""; pageStarts = [0]; pageIndex = 0; searchOrigin = null;
         reader.Clear(); chapters.Items.Clear(); bookmarks.Items.Clear(); results.Items.Clear();
         if (readerTitle != null) readerTitle.Text = "";
         loading = false;
@@ -607,77 +629,213 @@ public sealed class ReaderForm : Form
     private void RestoreFromTray()
     {
         Show();
-        WindowState = FormWindowState.Normal;
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
         Activate();
     }
-    private void ApplyMode() { reader.ReadOnly = true; reader.ScrollBars = settings.Mode == "滚动" ? RichTextBoxScrollBars.Vertical : RichTextBoxScrollBars.None; }
+    private void ApplyMode() => Reflow();
+
+    private void RefreshChapters()
+    {
+        bool wasLoading = loading; loading = true;
+        chapters.BeginUpdate();
+        try
+        {
+            chapters.Items.Clear();
+            if (currentBook != null)
+            {
+                string filter = chapterFilter.Text.Trim();
+                chapters.Items.AddRange(currentBook.Chapters.Where(c => c.Title.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToArray());
+                if (currentChapter >= 0 && currentChapter < currentBook.Chapters.Count) chapters.SelectedItem = currentBook.Chapters[currentChapter];
+            }
+        }
+        finally { chapters.EndUpdate(); loading = wasLoading; }
+    }
+
+    private void GoChapterNumber()
+    {
+        if (currentBook == null || !int.TryParse(chapterNumber.Text.Trim(), out int number) || number < 1) { chapterNumber.BackColor = Color.MistyRose; return; }
+        int index = currentBook.Chapters.FindIndex(c => ReadingTools.ChapterNumber(c.Title) == number);
+        if (index < 0 && !currentBook.Chapters.Any(c => ReadingTools.ChapterNumber(c.Title) != null) && number <= currentBook.Chapters.Count) index = number - 1;
+        if (index < 0) { chapterNumber.BackColor = Color.MistyRose; return; }
+        chapterNumber.BackColor = SystemColors.Window;
+        chapterFilter.Clear(); OpenChapter(index, 0); reader.Focus();
+    }
+
+    private void MoveSearchResult(int direction)
+    {
+        int start = results.SelectedIndex;
+        for (int index = start < 0 ? (direction > 0 ? 0 : results.Items.Count - 1) : start + direction; index >= 0 && index < results.Items.Count; index += direction)
+            if (results.Items[index] is SearchHit hit && hit.BookId == currentBook?.Id) { results.SelectedIndex = index; JumpSearch(); return; }
+    }
+
+    private void ReturnFromSearch()
+    {
+        if (searchOrigin is not { } origin || currentBook?.Id != origin.BookId) return;
+        searchOrigin = null; OpenChapter(origin.Chapter, origin.Offset); reader.Focus();
+    }
+
+    private void OpenSearch()
+    {
+        if (focusMode) ToggleFocusMode();
+        mainSplit.Panel1Collapsed = false; directoryButton.Text = "收起目录";
+        sidebarTabs.SelectedIndex = 2; searchBox.Focus();
+    }
+
+    private void HandleShortcut(object? sender, KeyEventArgs e)
+    {
+        Keys pressed = e.KeyCode | e.Modifiers;
+        bool handled = true;
+        if (focusMode && e.KeyCode == Keys.Escape) ToggleFocusMode();
+        else if (pressed == (Keys)settings.HideWindowHotkey) HideToTray();
+        else if (pressed == (Keys)settings.FocusModeHotkey) ToggleFocusMode();
+        else if (pressed == (Keys)settings.DirectoryHotkey) ToggleDirectoryDrawer();
+        else
+        {
+            string? command = ReadingTools.Shortcuts.Keys.FirstOrDefault(c => ReadingTools.Shortcut(settings, c) == pressed);
+            bool typing = chapterFilter.Focused || chapterNumber.Focused || searchBox.Focused || fontSize.ContainsFocus || mode.ContainsFocus || theme.ContainsFocus;
+            if (command == null && reader.Focused && pressed is Keys.PageUp or Keys.PageDown) command = pressed == Keys.PageUp ? "PreviousPage" : "NextPage";
+            if (command == null || (typing && (e.Modifiers == Keys.None || command is "PreviousPage" or "NextPage" or "PreviousChapter" or "NextChapter" or "ScrollUp" or "ScrollDown" or "ChapterStart" or "ChapterEnd"))) handled = false;
+            else switch (command)
+            {
+                case "PreviousPage": ScrollLines(-VisibleLineCount()); break;
+                case "NextPage": ScrollLines(VisibleLineCount()); break;
+                case "PreviousChapter": PreviousChapter(); break;
+                case "NextChapter": NextChapter(); break;
+                case "ScrollUp": ScrollLines(-3); break;
+                case "ScrollDown": ScrollLines(3); break;
+                case "ChapterStart": if (reader.Paged) ShowPage(0); else ScrollToOffset(0); SavePosition(); break;
+                case "ChapterEnd": if (reader.Paged) ShowPage(pageStarts.Count - 1); else ScrollToOffset(chapterContent.Length); SavePosition(); break;
+                case "Bookmark": AddBookmark(this, EventArgs.Empty); break;
+                case "Search": OpenSearch(); break;
+                case "PreviousResult": MoveSearchResult(-1); break;
+                case "NextResult": MoveSearchResult(1); break;
+                case "Return": ReturnFromSearch(); break;
+                case "GoChapter": if (focusMode) ToggleFocusMode(); mainSplit.Panel1Collapsed = false; sidebarTabs.SelectedIndex = 1; chapterNumber.Focus(); break;
+            }
+        }
+        if (handled) { e.SuppressKeyPress = true; e.Handled = true; }
+    }
+
+    private void ScheduleReflow()
+    {
+        if (reflowPending || !IsHandleCreated || closing) return;
+        reflowPending = true;
+        int offset = reader.Paged ? pageStarts[pageIndex] : GetVisibleOffset();
+        BeginInvoke(() => { reflowPending = false; if (!closing && !IsDisposed) Reflow(offset); });
+    }
+
+    private void Reflow(int? requestedOffset = null)
+    {
+        if (currentBook == null || currentChapter < 0) return;
+        int offset = Math.Clamp(requestedOffset ?? currentBook.LastOffset, 0, chapterContent.Length);
+        bool wasLoading = loading; loading = true;
+        try
+        {
+            reader.Paged = settings.Mode == "翻页";
+            reader.ScrollBars = reader.Paged ? RichTextBoxScrollBars.None : RichTextBoxScrollBars.Vertical;
+            reader.Text = chapterContent;
+            pageStarts = [0]; pageIndex = 0;
+            ApplyParagraphLayout();
+            if (reader.Paged)
+            {
+                using var layout = new RichTextBox { Font = reader.Font, Size = reader.ClientSize, BorderStyle = BorderStyle.None, ScrollBars = RichTextBoxScrollBars.None, Rtf = reader.Rtf };
+                pageStarts = ReadingTools.Paginate(layout, reader.ClientSize);
+                int index = pageStarts.FindLastIndex(start => start <= offset);
+                ShowPage(Math.Max(0, index));
+            }
+            else ScrollToOffset(offset);
+        }
+        finally { loading = wasLoading; }
+    }
+
+    private void ShowPage(int index)
+    {
+        pageIndex = Math.Clamp(index, 0, pageStarts.Count - 1);
+        int start = pageStarts[pageIndex], end = pageIndex + 1 < pageStarts.Count ? pageStarts[pageIndex + 1] : chapterContent.Length;
+        bool wasLoading = loading; loading = true;
+        try { reader.Text = chapterContent[start..end]; ApplyParagraphLayout(); reader.Select(0, 0); reader.ScrollToCaret(); }
+        finally { loading = wasLoading; }
+        if (readerTitle != null && currentBook != null) readerTitle.Text = $"{currentBook.Title} · {currentBook.Chapters[currentChapter].Title} · 第{pageIndex + 1}/{pageStarts.Count}页";
+        if (!loading) SavePosition();
+    }
+
+    private void TurnPage(int direction)
+    {
+        if (currentBook == null) return;
+        if (!reader.Paged) { ScrollLines(direction * VisibleLineCount()); return; }
+        if (pageIndex + direction >= 0 && pageIndex + direction < pageStarts.Count) ShowPage(pageIndex + direction);
+        else if (direction > 0) NextChapter();
+        else if (currentChapter > 0) OpenChapter(currentChapter - 1, int.MaxValue);
+    }
+
+    internal int ResizeHit(Point screenPoint)
+    {
+        if (!focusMode) return 0;
+        var point = PointToClient(screenPoint);
+        int edge = Math.Max(6, DeviceDpi / 12);
+        bool left = point.X < edge, right = point.X >= ClientSize.Width - edge, top = point.Y < edge, bottom = point.Y >= ClientSize.Height - edge;
+        return top ? (left ? 13 : right ? 14 : 12) : bottom ? (left ? 16 : right ? 17 : 15) : left ? 10 : right ? 11 : 0;
+    }
+    [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern bool ReleaseCapture();
+    private void BeginWindowAction(int hit)
+    {
+        if (!focusMode) return;
+        Point point = Cursor.Position;
+        int coordinates = (point.X & 0xffff) | ((point.Y & 0xffff) << 16);
+        ReleaseCapture(); SendMessage(Handle, 0x00A1, (IntPtr)hit, (IntPtr)coordinates);
+    }
+    protected override void WndProc(ref Message m)
+    {
+        if (focusMode && m.Msg == 0x0084) { int hit = ResizeHit(new Point(unchecked((int)m.LParam))); if (hit != 0) { m.Result = (IntPtr)hit; return; } }
+        base.WndProc(ref m);
+    }
 }
 
 
 internal sealed class ReaderSettingsDialog : Form
 {
-    private readonly HotkeyTextBox focusKey;
-    private readonly HotkeyTextBox hideKey;
-    private readonly HotkeyTextBox directoryKey;
-    private readonly NumericUpDown textMargin;
-    private readonly NumericUpDown lineSpacing;
-    private readonly NumericUpDown paragraphSpacing;
+    private readonly Dictionary<string, HotkeyTextBox> shortcuts = [];
+    private readonly NumericUpDown textMargin, lineSpacing, paragraphSpacing;
     public int TextMargin => (int)textMargin.Value;
     public decimal LineSpacing => lineSpacing.Value;
     public int ParagraphSpacing => (int)paragraphSpacing.Value;
-    public Keys FocusModeKey => focusKey.Hotkey;
-    public Keys HideWindowKey => hideKey.Hotkey;
-    public Keys DirectoryKey => directoryKey.Hotkey;
-
+    public Keys FocusModeKey => shortcuts["Focus"].Hotkey;
+    public Keys HideWindowKey => shortcuts["Hide"].Hotkey;
+    public Keys DirectoryKey => shortcuts["Directory"].Hotkey;
+    public Dictionary<string, int> NavigationHotkeys => ReadingTools.Shortcuts.Keys.ToDictionary(c => c, c => (int)shortcuts[c].Hotkey);
     public ReaderSettingsDialog(ReaderSettings settings)
     {
-        Text = "Read_me 设置";
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        StartPosition = FormStartPosition.CenterParent;
-        MinimizeBox = false; MaximizeBox = false;
-        ClientSize = new Size(430, 400);
-        Font = new Font("Microsoft YaHei UI", 9F);
-
-        focusKey = new HotkeyTextBox((Keys)settings.FocusModeHotkey);
-        hideKey = new HotkeyTextBox((Keys)settings.HideWindowHotkey);
-        directoryKey = new HotkeyTextBox((Keys)settings.DirectoryHotkey);
+        Text = "Read_me 设置"; ClientSize = new Size(460, 620); StartPosition = FormStartPosition.CenterParent;
+        MinimizeBox = false; MaximizeBox = false; FormBorderStyle = FormBorderStyle.FixedDialog;
+        var grid = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(12) };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
+        void Row(string label, Control control)
+        {
+            int row = grid.RowCount++; grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            grid.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left }, 0, row); grid.Controls.Add(control, 1, row);
+        }
+        void Shortcut(string id, string label, Keys key) { var input = new HotkeyTextBox(key); shortcuts[id] = input; Row(label, input); }
+        Shortcut("Focus", "专注模式", (Keys)settings.FocusModeHotkey); Shortcut("Hide", "隐藏到托盘", (Keys)settings.HideWindowHotkey); Shortcut("Directory", "展开／收起目录", (Keys)settings.DirectoryHotkey);
+        foreach (var item in ReadingTools.Shortcuts) Shortcut(item.Key, item.Value.Label, ReadingTools.Shortcut(settings, item.Key));
         textMargin = new NumericUpDown { Minimum = 0, Maximum = 100, Value = Math.Clamp(settings.TextMargin, 0, 100), Dock = DockStyle.Fill };
         lineSpacing = new NumericUpDown { Minimum = 1, Maximum = 3, DecimalPlaces = 2, Increment = 0.05m, Value = Math.Clamp(settings.LineSpacing, 1m, 3m), Dock = DockStyle.Fill };
         paragraphSpacing = new NumericUpDown { Minimum = 0, Maximum = 40, Value = Math.Clamp(settings.ParagraphSpacing, 0, 40), Dock = DockStyle.Fill };
-        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 270, Padding = new Padding(14), ColumnCount = 2, RowCount = 6 };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 56));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44));
-        for (int i = 0; i < 6; i++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        grid.Controls.Add(new Label { Text = "专注模式", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
-        grid.Controls.Add(focusKey, 1, 0);
-        grid.Controls.Add(new Label { Text = "隐藏窗口到托盘", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
-        grid.Controls.Add(hideKey, 1, 1);
-        grid.Controls.Add(new Label { Text = "展开／收起目录", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 2);
-        grid.Controls.Add(directoryKey, 1, 2);
-        grid.Controls.Add(new Label { Text = "正文四周留白（像素）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 3);
-        grid.Controls.Add(textMargin, 1, 3);
-        grid.Controls.Add(new Label { Text = "行距（倍数）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4);
-        grid.Controls.Add(lineSpacing, 1, 4);
-        grid.Controls.Add(new Label { Text = "段落下方间距（磅）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 5);
-        grid.Controls.Add(paragraphSpacing, 1, 5);
-        var note = new Label { Dock = DockStyle.Top, Height = 34, Padding = new Padding(16, 4, 8, 0), Text = "点击输入框后按下要设置的组合键。Esc 可退出专注模式。" };
-        var error = new Label { Dock = DockStyle.Bottom, Height = 26, ForeColor = Color.Firebrick, Padding = new Padding(16, 3, 0, 0) };
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(8) };
-        var save = new Button { Text = "保存", DialogResult = DialogResult.None, AutoSize = true };
-        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, AutoSize = true };
+        Row("正文留白（像素）", textMargin); Row("行距（倍数）", lineSpacing); Row("段落下方间距（磅）", paragraphSpacing);
+        var scroller = new Panel { Dock = DockStyle.Fill, AutoScroll = true }; scroller.Controls.Add(grid);
+        var error = new Label { Dock = DockStyle.Bottom, Height = 40, ForeColor = Color.Firebrick };
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 45, FlowDirection = FlowDirection.RightToLeft };
+        var save = new Button { Text = "保存" }; var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel };
         save.Click += (_, _) =>
         {
-            var values = new[] { focusKey.Hotkey, hideKey.Hotkey, directoryKey.Hotkey };
-            if (values.Any(k => k == Keys.None)) { error.Text = "请为每个操作设置快捷键。"; return; }
-            if (values.Distinct().Count() != values.Length) { error.Text = "快捷键不能重复。"; return; }
+            var keys = shortcuts.Values.Select(s => s.Hotkey).ToArray();
+            if (keys.Any(k => k == Keys.None || (k & Keys.KeyCode) == Keys.Escape)) { error.Text = "快捷键不能为空；Esc保留用于退出专注模式。"; return; }
+            if (keys.Distinct().Count() != keys.Length) { error.Text = "快捷键不能重复。"; return; }
+            if (shortcuts.Where(p => p.Key is "Focus" or "Hide" or "Directory" or "Bookmark" or "Search" or "PreviousResult" or "NextResult" or "Return" or "GoChapter").Any(p => (p.Value.Hotkey & Keys.Modifiers) == 0 && (p.Value.Hotkey & Keys.KeyCode) < Keys.F1)) { error.Text = "全局操作请使用组合键或功能键，避免影响输入。"; return; }
             DialogResult = DialogResult.OK; Close();
         };
-        buttons.Controls.Add(save); buttons.Controls.Add(cancel);
-        Controls.Add(grid); Controls.Add(note); Controls.Add(error); Controls.Add(buttons);
-        AcceptButton = save; CancelButton = cancel;
+        buttons.Controls.AddRange([save, cancel]); Controls.Add(scroller); Controls.Add(error); Controls.Add(buttons); CancelButton = cancel;
     }
 }
-
 internal sealed class HotkeyTextBox : TextBox
 {
     public Keys Hotkey { get; private set; }

@@ -21,6 +21,7 @@ public sealed class ReaderSettings
     public int FocusModeHotkey { get; set; } = (int)Keys.F11;
     public int HideWindowHotkey { get; set; } = (int)(Keys.Control | Keys.H);
     public int DirectoryHotkey { get; set; } = (int)(Keys.Control | Keys.D);
+    public Dictionary<string, int> NavigationHotkeys { get; set; } = [];
     public int WindowX { get; set; }
     public int WindowY { get; set; }
     public int WindowWidth { get; set; }
@@ -116,7 +117,7 @@ public static partial class TxtImporter
     [GeneratedRegex(@"^\s*(?:序章|序言|前言|楔子|后记|尾声|番外)(?:[\s\d零〇一二三四五六七八九十、：:.．-].*)?\s*$")]
     private static partial Regex ExtraHeading();
 
-    public static BookRecord Import(string sourcePath, string root, IProgress<string>? progress = null, CancellationToken token = default)
+    public static BookRecord Import(string sourcePath, string root, IProgress<string>? progress = null, CancellationToken token = default, ImportOptions? options = null)
     {
         if (!File.Exists(sourcePath)) throw new FileNotFoundException("找不到 TXT 文件。", sourcePath);
         Directory.CreateDirectory(root);
@@ -134,7 +135,7 @@ public static partial class TxtImporter
             progress?.Report("复制原文件…");
             File.Copy(sourcePath, Path.Combine(bookPath, "original.txt"));
             progress?.Report("识别编码和章节…");
-            using var reader = new StreamReader(sourcePath, DetectEncoding(sourcePath), true);
+            using var reader = new StreamReader(sourcePath, GetEncoding(sourcePath, options), options?.EncodingName == null || options.EncodingName == "自动");
             var body = new StringBuilder();
             string currentTitle = "书籍信息";
             bool haveChapter = false;
@@ -148,10 +149,12 @@ public static partial class TxtImporter
                 bool arabic = int.TryParse(match.Groups[1].Value, out int chapterNumber);
                 // ponytail: short heading heuristic; add an import preview if unusual books need manual rules.
                 bool longInlineHeading = numbered && line.Length > 120 && arabic && chapterNumber == previousNumber + 1;
-                if ((numbered && (line.Length <= 120 || longInlineHeading)) || (line.Length <= 80 && ExtraHeading().IsMatch(line)))
+                bool custom = options?.Pattern is { Length: > 0 };
+                bool detected = custom ? options!.HeadingRegex!.IsMatch(line) : options?.Rule != "不分章" && ((numbered && (line.Length <= 120 || longInlineHeading)) || (line.Length <= 80 && ExtraHeading().IsMatch(line)));
+                if (detected)
                 {
                     string headingText = match.Groups[3].Value.Trim();
-                    bool longHeading = numbered && headingText.Length > 40;
+                    bool longHeading = !custom && numbered && headingText.Length > 40;
                     if (haveChapter) Flush();
                     else if (!string.IsNullOrWhiteSpace(body.ToString())) Flush();
                     else body.Clear();
@@ -182,6 +185,13 @@ public static partial class TxtImporter
             Directory.Delete(bookPath, true);
             throw;
         }
+    }
+
+    public static Encoding GetEncoding(string path, ImportOptions? options)
+    {
+        if (options?.EncodingName is null or "自动") return DetectEncoding(path);
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        return Encoding.GetEncoding(options.EncodingName, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
     }
 
     private static Encoding DetectEncoding(string path)
@@ -216,7 +226,7 @@ public static class BookSearch
         for (int chapter = 0; chapter < book.Chapters.Count; chapter++)
         {
             token.ThrowIfCancellationRequested();
-            string content = LibraryStore.ReadChapter(book, chapter);
+            string content = LibraryStore.ReadChapter(book, chapter).Replace("\r\n", "\n").Replace('\r', '\n');
             int start = 0;
             while (start < content.Length)
             {
@@ -234,5 +244,3 @@ public static class BookSearch
         return hits;
     }
 }
-
-
