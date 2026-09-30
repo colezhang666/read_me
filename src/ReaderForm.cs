@@ -17,6 +17,7 @@ public sealed class ReaderForm : Form
     private Label? readerTitle;
     private readonly Button directoryButton = new() { Text = "收起目录", AutoSize = true };
     private readonly ListBox books = new() { Dock = DockStyle.Fill };
+    private readonly ListBox removedBooks = new() { Dock = DockStyle.Fill };
     private readonly ListBox chapters = new() { Dock = DockStyle.Fill };
     private readonly RichTextBox reader = new() { Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, DetectUrls = false, ReadOnly = true, HideSelection = false };
     private readonly ComboBox mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
@@ -67,6 +68,7 @@ public sealed class ReaderForm : Form
         LoadBooks();
         Shown += (_, _) =>
         {
+            ApplyParagraphLayout();
             RestoreReadingPosition();
             if (LibraryStore.RecoveryNotice != null) MessageBox.Show(this, LibraryStore.RecoveryNotice, "存档恢复");
         };
@@ -123,9 +125,23 @@ public sealed class ReaderForm : Form
 
         var left = sidebarTabs;
         var bookTab = new TabPage("书架"); bookTab.Controls.Add(books); books.SelectedIndexChanged += (_, _) => SelectBook(); left.TabPages.Add(bookTab);
+        var bookMenu = new ContextMenuStrip();
+        bookMenu.Items.Add("重命名", null, (_, _) => RenameSelectedBook());
+        bookMenu.Items.Add("移入回收站", null, (_, _) =>
+        {
+            if (books.SelectedItem is BookRecord book && MessageBox.Show(this, $"将《{book.Title}》移入回收站？正文、进度和书签会保留，可恢复。", "移除书籍", MessageBoxButtons.YesNo) == DialogResult.Yes) RemoveBook(book);
+        });
+        books.ContextMenuStrip = bookMenu;
+        books.MouseDown += (_, e) => { if (e.Button == MouseButtons.Right) { int index = books.IndexFromPoint(e.Location); if (index >= 0) books.SelectedIndex = index; } };
         var chapterTab = new TabPage("目录"); chapterTab.Controls.Add(chapters); chapters.SelectedIndexChanged += (_, _) => SelectChapter(); left.TabPages.Add(chapterTab);
         var searchTab = new TabPage("搜索结果"); searchTab.Controls.Add(results); results.DoubleClick += (_, _) => JumpSearch(); left.TabPages.Add(searchTab);
         var bookmarkTab = new TabPage("书签"); bookmarkTab.Controls.Add(bookmarks); bookmarks.DoubleClick += (_, _) => JumpBookmark(); left.TabPages.Add(bookmarkTab);
+        var trashTab = new TabPage("回收站"); trashTab.Controls.Add(removedBooks); left.TabPages.Add(trashTab);
+        var trashMenu = new ContextMenuStrip();
+        trashMenu.Items.Add("恢复到书架", null, (_, _) => { if (removedBooks.SelectedItem is BookRecord book) RestoreBook(book); });
+        removedBooks.ContextMenuStrip = trashMenu;
+        removedBooks.MouseDown += (_, e) => { if (e.Button == MouseButtons.Right) { int index = removedBooks.IndexFromPoint(e.Location); if (index >= 0) removedBooks.SelectedIndex = index; } };
+        removedBooks.DoubleClick += (_, _) => { if (removedBooks.SelectedItem is BookRecord book) RestoreBook(book); };
 
         var split = mainSplit;
         split.Panel1.Controls.Add(left);
@@ -142,6 +158,7 @@ public sealed class ReaderForm : Form
     private void LoadBooks()
     {
         books.Items.Clear(); books.Items.AddRange(settings.Books.ToArray());
+        removedBooks.Items.Clear(); removedBooks.Items.AddRange(settings.RemovedBooks.ToArray());
         if (settings.CurrentBookId != null)
         {
             int index = settings.Books.FindIndex(x => x.Id == settings.CurrentBookId);
@@ -183,6 +200,7 @@ public sealed class ReaderForm : Form
             string content = LibraryStore.ReadChapter(currentBook, index);
             currentChapter = index; currentBook.LastChapter = index;
             reader.Text = content;
+            ApplyParagraphLayout();
             ScrollToOffset(offset);
             currentBook.LastOffset = Math.Clamp(offset, 0, reader.TextLength);
             chapters.SelectedIndex = index;
@@ -206,10 +224,11 @@ public sealed class ReaderForm : Form
             Cursor = Cursors.WaitCursor;
             var progress = new Progress<string>(text => { if (!closing) Text = "Read_me · " + text; });
             var book = await Task.Run(() => TxtImporter.Import(dialog.FileName, LibraryStore.Root, progress));
-            var duplicate = settings.Books.FirstOrDefault(x => x.Fingerprint == book.Fingerprint);
+            var duplicate = settings.Books.Concat(settings.RemovedBooks).FirstOrDefault(x => x.Fingerprint == book.Fingerprint);
             if (duplicate != null)
             {
                 Directory.Delete(Path.Combine(LibraryStore.Root, book.Id), true);
+                if (settings.RemovedBooks.Contains(duplicate)) RestoreBook(duplicate);
                 books.SelectedItem = duplicate;
                 MessageBox.Show(this, "这本书已经在书架中，已打开现有书籍。", "重复导入");
                 return;
@@ -358,7 +377,10 @@ public sealed class ReaderForm : Form
             settings.DirectoryHotkey = (int)dialog.DirectoryKey;
             int offset = GetVisibleOffset();
             settings.TextMargin = dialog.TextMargin;
+            settings.LineSpacing = dialog.LineSpacing;
+            settings.ParagraphSpacing = dialog.ParagraphSpacing;
             readerPanel.Padding = new Padding(settings.TextMargin);
+            ApplyParagraphLayout();
             ScrollToOffset(offset);
             SaveState();
         }
@@ -455,15 +477,99 @@ public sealed class ReaderForm : Form
         Persist();
     }
 
-    private void Persist()
+    private bool Persist()
     {
         saveTimer.Stop();
-        try { LibraryStore.Save(settings); saveFailed = false; }
+        try { LibraryStore.Save(settings); saveFailed = false; return true; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             if (!saveFailed) MessageBox.Show(this, "存档保存失败，请检查磁盘空间和 ReaderData 文件夹权限。\n" + ex.Message, "存档失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
             saveFailed = true;
+            return false;
         }
+    }
+
+    private void RenameSelectedBook()
+    {
+        if (books.SelectedItem is not BookRecord book) return;
+        using var dialog = new Form { Text = "重命名书籍", ClientSize = new Size(380, 105), StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false };
+        var input = new TextBox { Text = book.Title, Left = 12, Top = 15, Width = 355, MaxLength = 200 };
+        var save = new Button { Text = "保存", Left = 285, Top = 60, DialogResult = DialogResult.OK };
+        dialog.Controls.AddRange([input, save]); dialog.AcceptButton = save;
+        if (dialog.ShowDialog(this) == DialogResult.OK && !RenameBook(book, input.Text)) MessageBox.Show(this, "书名不能为空且不能超过200个字符，或存档保存失败。", "重命名失败");
+    }
+
+    private bool RenameBook(BookRecord book, string title)
+    {
+        title = title.Trim();
+        if (title.Length == 0 || title.Length > 200 || !settings.Books.Contains(book)) return false;
+        string old = book.Title; book.Title = title;
+        if (!Persist()) { book.Title = old; return false; }
+        int index = books.Items.IndexOf(book); if (index >= 0) books.Items[index] = book;
+        if (currentBook == book && currentChapter >= 0 && readerTitle != null) readerTitle.Text = $"{book.Title}  ·  {book.Chapters[currentChapter].Title}  ({currentChapter + 1}/{book.Chapters.Count})";
+        return true;
+    }
+
+    private void RemoveBook(BookRecord book)
+    {
+        if (!settings.Books.Contains(book)) return;
+        SaveState(); if (saveFailed) return;
+        int index = settings.Books.IndexOf(book);
+        string? previousId = settings.CurrentBookId;
+        settings.Books.Remove(book); settings.RemovedBooks.Add(book);
+        if (previousId == book.Id) settings.CurrentBookId = settings.Books.FirstOrDefault()?.Id;
+        if (!Persist()) { settings.RemovedBooks.Remove(book); settings.Books.Insert(index, book); settings.CurrentBookId = previousId; return; }
+        ClearReading(); LoadBooks();
+    }
+
+    private void RestoreBook(BookRecord book)
+    {
+        if (!settings.RemovedBooks.Contains(book)) return;
+        SaveState(); if (saveFailed) return;
+        string? previousId = settings.CurrentBookId;
+        int index = settings.RemovedBooks.IndexOf(book);
+        settings.RemovedBooks.Remove(book); settings.Books.Add(book); settings.CurrentBookId = book.Id;
+        if (!Persist()) { settings.Books.Remove(book); settings.RemovedBooks.Insert(index, book); settings.CurrentBookId = previousId; return; }
+        ClearReading(); LoadBooks();
+    }
+
+    private void ClearReading()
+    {
+        searchCancellation?.Cancel();
+        loading = true;
+        currentBook = null; currentChapter = -1;
+        reader.Clear(); chapters.Items.Clear(); bookmarks.Items.Clear(); results.Items.Clear();
+        if (readerTitle != null) readerTitle.Text = "";
+        loading = false;
+    }
+
+    // PARAFORMAT2 offsets and flags follow the Windows SDK Richedit.h definition.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 188)]
+    private struct ParagraphFormat
+    {
+        [System.Runtime.InteropServices.FieldOffset(0)] public uint Size;
+        [System.Runtime.InteropServices.FieldOffset(4)] public uint Mask;
+        [System.Runtime.InteropServices.FieldOffset(160)] public int SpaceAfter;
+        [System.Runtime.InteropServices.FieldOffset(164)] public int LineSpacing;
+        [System.Runtime.InteropServices.FieldOffset(170)] public byte Rule;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "SendMessageW")]
+    private static extern IntPtr SendParagraphFormat(IntPtr handle, int message, IntPtr wParam, ref ParagraphFormat format);
+
+    private void ApplyParagraphLayout()
+    {
+        if (!reader.IsHandleCreated || reader.TextLength == 0) return;
+        bool wasLoading = loading; loading = true;
+        int start = reader.SelectionStart, length = reader.SelectionLength, offset = GetVisibleOffset();
+        try
+        {
+            reader.SelectAll();
+            var format = new ParagraphFormat { Size = 188, Mask = 0x100 | 0x80, LineSpacing = (int)(Math.Clamp(settings.LineSpacing, 1m, 3m) * 20), Rule = 5, SpaceAfter = Math.Clamp(settings.ParagraphSpacing, 0, 40) * 20 };
+            if (SendParagraphFormat(reader.Handle, 0x0447, IntPtr.Zero, ref format) == IntPtr.Zero) throw new InvalidOperationException("正文排版设置失败。");
+            ScrollToOffset(offset); reader.Select(start, length);
+        }
+        finally { loading = wasLoading; }
     }
     private void ApplyFont()
     {
@@ -514,7 +620,11 @@ internal sealed class ReaderSettingsDialog : Form
     private readonly HotkeyTextBox hideKey;
     private readonly HotkeyTextBox directoryKey;
     private readonly NumericUpDown textMargin;
+    private readonly NumericUpDown lineSpacing;
+    private readonly NumericUpDown paragraphSpacing;
     public int TextMargin => (int)textMargin.Value;
+    public decimal LineSpacing => lineSpacing.Value;
+    public int ParagraphSpacing => (int)paragraphSpacing.Value;
     public Keys FocusModeKey => focusKey.Hotkey;
     public Keys HideWindowKey => hideKey.Hotkey;
     public Keys DirectoryKey => directoryKey.Hotkey;
@@ -525,17 +635,19 @@ internal sealed class ReaderSettingsDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MinimizeBox = false; MaximizeBox = false;
-        ClientSize = new Size(430, 320);
+        ClientSize = new Size(430, 400);
         Font = new Font("Microsoft YaHei UI", 9F);
 
         focusKey = new HotkeyTextBox((Keys)settings.FocusModeHotkey);
         hideKey = new HotkeyTextBox((Keys)settings.HideWindowHotkey);
         directoryKey = new HotkeyTextBox((Keys)settings.DirectoryHotkey);
         textMargin = new NumericUpDown { Minimum = 0, Maximum = 100, Value = Math.Clamp(settings.TextMargin, 0, 100), Dock = DockStyle.Fill };
-        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 190, Padding = new Padding(14), ColumnCount = 2, RowCount = 4 };
+        lineSpacing = new NumericUpDown { Minimum = 1, Maximum = 3, DecimalPlaces = 2, Increment = 0.05m, Value = Math.Clamp(settings.LineSpacing, 1m, 3m), Dock = DockStyle.Fill };
+        paragraphSpacing = new NumericUpDown { Minimum = 0, Maximum = 40, Value = Math.Clamp(settings.ParagraphSpacing, 0, 40), Dock = DockStyle.Fill };
+        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 270, Padding = new Padding(14), ColumnCount = 2, RowCount = 6 };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 56));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44));
-        for (int i = 0; i < 4; i++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        for (int i = 0; i < 6; i++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         grid.Controls.Add(new Label { Text = "专注模式", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
         grid.Controls.Add(focusKey, 1, 0);
         grid.Controls.Add(new Label { Text = "隐藏窗口到托盘", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
@@ -544,6 +656,10 @@ internal sealed class ReaderSettingsDialog : Form
         grid.Controls.Add(directoryKey, 1, 2);
         grid.Controls.Add(new Label { Text = "正文四周留白（像素）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 3);
         grid.Controls.Add(textMargin, 1, 3);
+        grid.Controls.Add(new Label { Text = "行距（倍数）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4);
+        grid.Controls.Add(lineSpacing, 1, 4);
+        grid.Controls.Add(new Label { Text = "段落下方间距（磅）", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 5);
+        grid.Controls.Add(paragraphSpacing, 1, 5);
         var note = new Label { Dock = DockStyle.Top, Height = 34, Padding = new Padding(16, 4, 8, 0), Text = "点击输入框后按下要设置的组合键。Esc 可退出专注模式。" };
         var error = new Label { Dock = DockStyle.Bottom, Height = 26, ForeColor = Color.Firebrick, Padding = new Padding(16, 3, 0, 0) };
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(8) };

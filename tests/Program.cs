@@ -111,16 +111,45 @@ internal static class Program
                 Check(form.Bounds == bounds && form.FormBorderStyle != FormBorderStyle.None, "退出专注模式恢复窗口");
                 var hits = BookSearch.Search(first, "测试正文", 5);
                 Check(hits.Count == 5 && hits.All(x => x.BookId == first.Id), "搜索限制和书籍身份绑定");
+                Call(form, "OpenChapter", 0, 0);
+                string unchangedText = reader.Text;
+                int secondLine = reader.GetFirstCharIndexFromLine(1);
+                int normalGap = reader.GetPositionFromCharIndex(secondLine).Y - reader.GetPositionFromCharIndex(0).Y;
+                live.LineSpacing = 1.8m; live.ParagraphSpacing = 6;
+                Call(form, "ApplyParagraphLayout");
+                int expandedGap = reader.GetPositionFromCharIndex(secondLine).Y - reader.GetPositionFromCharIndex(0).Y;
+                Check(expandedGap > normalGap && reader.Text == unchangedText, "原生行距和段距生效且不修改正文");
+                var formatType = typeof(ReaderForm).GetNestedType("ParagraphFormat", BindingFlags.NonPublic)!;
+                object format = Activator.CreateInstance(formatType)!;
+                formatType.GetField("Size")!.SetValue(format, (uint)188);
+                object[] formatArgs = [reader.Handle, 0x043D, IntPtr.Zero, format];
+                typeof(ReaderForm).GetMethod("SendParagraphFormat", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, formatArgs);
+                Check((int)formatType.GetField("LineSpacing")!.GetValue(formatArgs[3])! == 36 && (int)formatType.GetField("SpaceAfter")!.GetValue(formatArgs[3])! == 120, "读取Windows原生排版参数验证1.8倍行距和6磅段距");
+                var activeBook = live.Books[0];
+                string bookId = activeBook.Id;
+                Check(!(bool)Call(form, "RenameBook", activeBook, "   ")!, "空书名被拒绝");
+                Check((bool)Call(form, "RenameBook", activeBook, "我的测试书")! && LibraryStore.Load().Books[0].Title == "我的测试书", "书籍重命名持久化");
+                Call(form, "OpenChapter", 0, saved.Books[0].LastOffset);
+                activeBook.Bookmarks.Add(new BookmarkRecord { Chapter = 0, Offset = 120, Label = "测试书签" });
+                Call(form, "RemoveBook", activeBook);
+                Check(live.Books.All(b => b.Id != bookId) && live.RemovedBooks.Single().Id == bookId && File.Exists(LibraryStore.ChapterPath(activeBook, 0)), "移入回收站保留正文文件");
+                Check(Field<BookRecord>(form, "currentBook").Id != bookId, "移除当前书后切换到剩余书籍");
+                Call(form, "RestoreBook", activeBook);
+                Check(live.RemovedBooks.Count == 0 && activeBook.Bookmarks.Single().Offset == 120 && activeBook.LastOffset > 0, "恢复书籍保留书签和章内进度");
+                Call(form, "SaveState");
+                Check(LibraryStore.Load().LineSpacing == 1.8m && LibraryStore.Load().ParagraphSpacing == 6, "排版设置持久化");
+                Check(LibraryStore.Load().RemovedBooks.Count == 0 && LibraryStore.Load().Books.Any(b => b.Id == bookId), "恢复后的书架状态持久化");
+                foreach (var item in live.Books.ToArray()) Call(form, "RemoveBook", item);
+                Check(live.Books.Count == 0 && reader.TextLength == 0 && chapters.Items.Count == 0, "移除最后一本书清空正文和目录");
+                Call(form, "RestoreBook", activeBook);
                 form.Close();
                 using var reopened = new ReaderForm();
                 reopened.Show(); Application.DoEvents();
                 var reopenedReader = Field<RichTextBox>(reopened, "reader"); Check(reopenedReader.GetLineFromCharIndex((int)Call(reopened, "GetVisibleOffset")!) == reopenedReader.GetLineFromCharIndex(saved.Books[0].LastOffset), "退出再打开精确恢复所在行");
-                reopened.Close();
+                var reopenedLive = Field<ReaderSettings>(reopened, "settings"); Check(reopenedLive.LineSpacing == 1.8m && reopenedReader.GetPositionFromCharIndex(reopenedReader.GetFirstCharIndexFromLine(1)).Y - reopenedReader.GetPositionFromCharIndex(0).Y > normalGap, "重开自动应用保存的排版设置"); reopened.Close();
             }
             finally { if (Directory.Exists(testRoot)) Directory.Delete(testRoot, true); }
         }
         finally { Directory.Delete(scratch, true); }
     }
 }
-
-

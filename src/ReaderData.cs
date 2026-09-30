@@ -9,12 +9,15 @@ namespace PocketReader;
 public sealed class ReaderSettings
 {
     public List<BookRecord> Books { get; set; } = [];
+    public List<BookRecord> RemovedBooks { get; set; } = [];
     public string? CurrentBookId { get; set; }
     public string Mode { get; set; } = "滚动";
     public string Theme { get; set; } = "浅色";
     public float FontSize { get; set; } = 17;
     public string FontFamilyName { get; set; } = "Microsoft YaHei UI";
     public int TextMargin { get; set; } = 12;
+    public decimal LineSpacing { get; set; } = 1;
+    public int ParagraphSpacing { get; set; }
     public int FocusModeHotkey { get; set; } = (int)Keys.F11;
     public int HideWindowHotkey { get; set; } = (int)(Keys.Control | Keys.H);
     public int DirectoryHotkey { get; set; } = (int)(Keys.Control | Keys.D);
